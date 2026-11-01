@@ -66,7 +66,11 @@ class ClPowerLaw(ClAnalytic):
     def __init__(self, ell0, amp=None, alpha=None):
         analytic_expr = 'amp * (ell / ell0)**alpha'
 
-        kwargs = {'ell0': ell0, 'alpha': alpha}
+        # Only substitute parameters that are fixed (not None).
+        # ell0 is always fixed; alpha is fixed only when provided as a scalar.
+        kwargs = {'ell0': ell0}
+        if alpha is not None:
+            kwargs['alpha'] = alpha
 
         super(ClPowerLaw, self).__init__(analytic_expr, **kwargs)
 
