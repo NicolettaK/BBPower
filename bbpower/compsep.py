@@ -841,16 +841,29 @@ class BBCompSep(PipelineStage):
         Taken from Cobaya written by H, L and Torrado
         See: https://github.com/CobayaSampler/cobaya/blob/master/cobaya/likelihoods/_cmblikes_prototype/_cmblikes_prototype.py  # noqa: E501
         """
-        model_cls = self.model(params)
-        dx_vec = []
-        for k in range(model_cls.shape[0]):
-            C = model_cls[k] + self.bbnoise[k]
-            X = self.h_and_l(C, self.observed_cls[k], self.Cfl_sqrt[k])
-            if np.any(np.isinf(X)):
-                return [np.inf]
-            dx = self.matrix_to_vector(X).flatten()
-            dx_vec = np.concatenate([dx_vec, dx])
-        return dx_vec
+        # all bandpowers at once (same algebra as h_and_l below)
+        C = self.model(params) + self.bbnoise
+        try:
+            d, U = np.linalg.eigh(C)
+        except np.linalg.LinAlgError:
+            return [np.inf]
+        if np.any(d <= 0):
+            return [np.inf]
+        Ut = np.swapaxes(U, -1, -2)
+        rot = Ut @ self.observed_cls @ U
+        roots = np.sqrt(d)
+        rot /= roots[:, :, None] * roots[:, None, :]
+        rot = U @ rot @ Ut
+        try:
+            d, rot = np.linalg.eigh(rot)
+        except np.linalg.LinAlgError:
+            return [np.inf]
+        if np.any(d <= 0):
+            return [np.inf]
+        g = np.sign(d - 1) * np.sqrt(2 * np.maximum(0, d - np.log(d) - 1))
+        U = self.Cfl_sqrt @ rot
+        X = (U * g[:, None, :]) @ np.swapaxes(U, -1, -2)
+        return self.matrix_to_vector(X).flatten()
 
     def h_and_l(self, C, Chat, Cfl_sqrt):
         try:
