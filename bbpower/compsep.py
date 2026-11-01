@@ -615,6 +615,92 @@ class BBCompSep(PipelineStage):
         return np.array([self.bpss[tn].convolve_sed(sed_der, params)[0]
                          for tn in range(self.nfreqs)]) * units * norm
 
+    def moment_covariance(self, params):
+        """
+        Covariance of the moment maps implied by the free moment spectra, at
+        every multipole of the data (l_min <= ell <= l_max): returns
+        ({(component, (n, m)): index}, matrix [nell, nmaps, nmaps]), or None
+        if no component has free moment spectra. w00 x w00 is the
+        component's own spectrum, the 0x0 cross between components
+        epsilon * sqrt(C C'); pairs without a free spectrum are 0.
+        """
+        if 'B' not in self.pol_order:
+            return None
+        ipb = self.pol_order['B']
+        sel = ((self.bpw_l >= self.config['l_min']) &
+               (self.bpw_l <= self.config['l_max']))
+        lx = np.log(self.bpw_l[sel] / 80.)
+        dl2cl = np.broadcast_to(self.dl2cl, self.bpw_l.shape)[sel]
+        fg_cell = None
+        idx, entries = {}, {}
+
+        def own(c_name):
+            nonlocal fg_cell
+            if fg_cell is None:
+                fg_cell = self.evaluate_power_spectra(params)
+            i_c = self.fg_model.component_order[c_name]
+            return fg_cell[i_c, ipb, ipb][sel]
+
+        def key(c_name, k):
+            if (c_name, k) not in idx:
+                idx[(c_name, k)] = len(idx)
+                if k == (0, 0):
+                    i = idx[(c_name, k)]
+                    entries[(i, i)] = own(c_name)
+                else:
+                    key(c_name, (0, 0))
+            return idx[(c_name, k)]
+
+        def add(i, j, cl):
+            i, j = min(i, j), max(i, j)
+            entries[(i, j)] = entries.get((i, j), 0.) + cl
+
+        for c_name in self.fg_model.component_names:
+            names_mom = self.fg_model.components[c_name]['names_moments_dict']
+            for tag, a, b, other in self.free_moment_terms(names_mom):
+                amp = params[names_mom['A_' + tag]]
+                if amp == 0:
+                    continue
+                slope = (params[names_mom['alpha_' + tag]]
+                         if 'alpha_' + tag in names_mom else 0.)
+                cl = amp * np.exp(slope * lx) * dl2cl
+                add(key(c_name, a), key(other or c_name, b), cl)
+        if not idx:
+            return None
+
+        # 0x0 cross between components present in the matrix
+        for c1 in self.fg_model.component_names:
+            for c2, eps in self.fg_model.components[c1]['names_x_dict'].items():
+                if (c1, (0, 0)) in idx and (c2, (0, 0)) in idx:
+                    i, j = idx[(c1, (0, 0))], idx[(c2, (0, 0))]
+                    add(i, j, params[eps] * np.sqrt(entries[(i, i)] *
+                                                    entries[(j, j)]))
+
+        n = len(idx)
+        mat = np.zeros([sel.sum(), n, n])
+        for (i, j), cl in entries.items():
+            mat[:, i, j] = cl
+            mat[:, j, i] = cl
+        return idx, mat
+
+    def moments_positive(self, params):
+        """
+        True if, at every multipole of the data, the covariance matrix of the
+        moment maps (moment_covariance) is positive semi-definite. Only
+        components with free moment spectra (and their cross partners)
+        enter. Enabled by fg_model: moments_positive: True.
+        """
+        cov = self.moment_covariance(params)
+        if cov is None:
+            return True
+        mat = cov[1]
+        # scale to unit diagonal where possible (eigenvalues of comparable
+        # size), then require non-negative eigenvalues
+        d = np.sqrt(np.abs(np.einsum('lii->li', mat)))
+        d[d == 0] = 1.
+        mat = mat / d[:, :, None] / d[:, None, :]
+        return bool(np.all(np.linalg.eigvalsh(mat)[:, 0] >= -1e-10))
+
     def add_free_moments(self, params, cls_array_fg):
         """
         Moment expansion with free cross spectra of the moment maps,
@@ -762,6 +848,10 @@ class BBCompSep(PipelineStage):
         Likelihood without priors. 
         """
         params = self.params.build_params(par)
+        fgm = self.config['fg_model']
+        if (fgm.get('use_moments') and fgm.get('moments_positive')
+                and not self.moments_positive(params)):
+            return -np.inf
         if self.use_handl:
             dx = self.h_and_l_dx(params)
             if np.any(np.isinf(dx)):
