@@ -1,3 +1,5 @@
+import math
+import re
 import numpy as np
 import os
 from scipy.linalg import sqrtm
@@ -33,11 +35,15 @@ class BBCompSep(PipelineStage):
         Pre-load the data, CMB BB power spectrum, and foreground models.
         """
         self.parse_sacc_file()
-        if self.config['fg_model'].get('use_moments'):
-            self.precompute_w3j()
         self.load_cmb()
         self.fg_model = FGModel(self.config)
         self.params = ParameterManager(self.config)
+        # The Wigner-3j cube is only needed by the beta-map moments
+        # (gamma_beta, amp_beta), not by the free moment spectra
+        if self.config['fg_model'].get('use_moments') and any(
+                'gamma_beta' in self.fg_model.components[c]['names_moments_dict']
+                for c in self.fg_model.component_names):
+            self.precompute_w3j()
         if self.use_handl:
             self.prepare_h_and_l()
         return
@@ -428,6 +434,8 @@ class BBCompSep(PipelineStage):
                                self.npol, self.npol])
             for i_c, c_name in enumerate(self.fg_model.component_names):
                 comp = self.fg_model.components[c_name]
+                if 'gamma_beta' not in comp['names_moments_dict']:
+                    continue
                 gamma = params[comp['names_moments_dict']['gamma_beta']]
                 amp = params[comp['names_moments_dict']['amp_beta']] * 1E-6
                 cl_betas = self.bcls(lmax=lmax_mom, gamma=gamma, amp=amp)
@@ -456,6 +464,9 @@ class BBCompSep(PipelineStage):
                                       fg_scaling_d2[f2, c1] *
                                       (fg_scaling[c1, c1, f1, f1])**0.5) * cls_02[c1]  # noqa: E501
                     cls_array_fg[f1, f2] += cls
+
+            # Free moment spectra (BB only)
+            self.add_free_moments(params, cls_array_fg)
 
         # Window convolution
         cls_array_list = np.zeros([self.n_bpws, self.nfreqs,
@@ -516,6 +527,140 @@ class BBCompSep(PipelineStage):
                 fg_scaling_der[i_c, tn] = sed_b * units
 
         return fg_scaling_der.T
+
+    @staticmethod
+    def free_moment_terms(names_mom):
+        """
+        Free moment spectra of a component: (tag, (n1, m1), (n2, m2)) for
+        each A_w<n1><m1>w<n2><m2> role in its moments block, i.e. the cross
+        spectrum of the moment maps w_nm = A * dbeta^n * dp^m (p = 1/T),
+        with n + m <= 2.
+        """
+        terms = []
+        for role in names_mom:
+            m = re.fullmatch(r'A_w(\d)(\d)w(\d)(\d)', role)
+            if m is None:
+                continue
+            a = (int(m.group(1)), int(m.group(2)))
+            b = (int(m.group(3)), int(m.group(4)))
+            if sum(a) > 2 or sum(b) > 2:
+                raise ValueError(f"free moment {role}: maps up to order 2")
+            if a == b == (0, 0):
+                raise ValueError("free moment A_w00w00 is the component "
+                                 "itself")
+            terms.append((role[2:], a, b))
+        return sorted(terms, key=lambda t: t[0])
+
+    def _sed_T(self, c_name):
+        """
+        Copy of the SED of a component with the temperature always free
+        (fgbuster drops fixed parameters from the SED signature).
+        """
+        comp = self.fg_model.components[c_name]
+        if 'sed_T' not in comp:
+            import fgbuster.component_model as fgc
+            from .fg_model import get_function
+            cfg_c = self.config['fg_model'][c_name]
+            kw = {}
+            for k, l in cfg_c['sed_parameters'].items():
+                fixed = l[1] == 'fixed' and l[0] != 'temp'
+                kw[l[0]] = l[2][0] if fixed else None
+            comp['sed_T'] = get_function(fgc, cfg_c['sed'])(
+                **kw, units='K_RJ')
+        return comp['sed_T']
+
+    def integrate_seds_der_bp(self, params, c_name, n, m, eps=1e-3):
+        """
+        Bandpass-integrated d^n/dbeta^n d^m/dp^m SED / (n! m!) of a
+        component, p = 1/T [1/K] (central finite differences in p, m <= 2).
+        [nfreq]
+        """
+        comp = self.fg_model.components[c_name]
+        units = comp['cmb_n0_norm']
+        nu0 = params[comp['names_sed_dict']['nu0']]
+        norm = 1. / (math.factorial(n) * math.factorial(m))
+        if m == 0:
+            sed = comp['sed']
+            sed_params = [params[comp['names_sed_dict'][k]]
+                          for k in sed.params]
+
+            def sed_der(nu):
+                return np.log(nu / nu0)**n * sed.eval(nu, *sed_params)
+        else:
+            if 'temp' not in comp['names_sed_dict']:
+                raise ValueError(f"{c_name}: temperature moments need a "
+                                 "'temp' SED parameter")
+            sed = self._sed_T(c_name)
+            keys = sed.params
+            sed_params = [params[comp['names_sed_dict'][k]] for k in keys]
+            i_t = keys.index('temp')
+            p0 = 1. / sed_params[i_t]
+            h = eps * p0
+
+            def sed_at(nu, p):
+                q = list(sed_params)
+                q[i_t] = 1. / p
+                return sed.eval(nu, *q)
+
+            def sed_der(nu):
+                fp, fm = sed_at(nu, p0 + h), sed_at(nu, p0 - h)
+                if m == 1:
+                    d = (fp - fm) / (2 * h)
+                else:
+                    d = (fp - 2 * sed_at(nu, p0) + fm) / h**2
+                return np.log(nu / nu0)**n * d
+
+        return np.array([self.bpss[tn].convolve_sed(sed_der, params)[0]
+                         for tn in range(self.nfreqs)]) * units * norm
+
+    def add_free_moments(self, params, cls_array_fg):
+        """
+        Moment expansion with free cross spectra of the moment maps,
+        following Vacher et al. 2022 (A&A 660, A111), with a power law in
+        ell for each moment spectrum instead of a free value per ell bin,
+        global beta0 and T0, and moments in p = 1/T.
+
+        With w_nm = A * (beta - beta0)^n * (p - p0)^m the moment maps of a
+        component (p = 1/T) and c_nm(nu) = <d^n_beta d^m_p SED> / (n! m!)
+        (bandpass-integrated), the BB spectrum gets, for each pair of maps
+        a != b and a == b respectively,
+
+            C^{ab}_ell [c_a(nu1) c_b(nu2) + c_b(nu1) c_a(nu2)]
+            C^{aa}_ell  c_a(nu1) c_a(nu2)
+
+        with C^{ab} = A_w<a>w<b> (ell/80)^alpha_w<a>w<b>, in D_ell units at
+        nu0 (same units as the amplitude of the component; dbeta
+        dimensionless, dp in 1/K). alpha is optional (default 0). Cross
+        terms (a != b) can be negative. Independent of the beta-map moments
+        (gamma_beta, amp_beta); BB only, no polarization rotation.
+        """
+        if 'B' not in self.pol_order:
+            return
+        ipb = self.pol_order['B']
+        lx = np.log(self.bpw_l / 80.)
+        cache = {}
+
+        def c_nm(c_name, k):
+            if (c_name, k) not in cache:
+                cache[(c_name, k)] = self.integrate_seds_der_bp(params, c_name,
+                                                               *k)
+            return cache[(c_name, k)]
+
+        for c_name in self.fg_model.component_names:
+            names_mom = self.fg_model.components[c_name]['names_moments_dict']
+            for tag, a, b in self.free_moment_terms(names_mom):
+                amp = params[names_mom['A_' + tag]]
+                if amp == 0:
+                    continue
+                slope = (params[names_mom['alpha_' + tag]]
+                         if 'alpha_' + tag in names_mom else 0.)
+                cl = amp * np.exp(slope * lx) * self.dl2cl
+                w = np.outer(c_nm(c_name, a), c_nm(c_name, b))
+                if a != b:
+                    w = w + w.T
+                for f1 in range(self.nfreqs):
+                    for f2 in range(f1, self.nfreqs):
+                        cls_array_fg[f1, f2, :, ipb, ipb] += w[f1, f2] * cl
 
     def evaluate_1x1(self, params, lmax, cls_cc, cls_bb):
         """
