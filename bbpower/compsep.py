@@ -531,24 +531,26 @@ class BBCompSep(PipelineStage):
     @staticmethod
     def free_moment_terms(names_mom):
         """
-        Free moment spectra of a component: (tag, (n1, m1), (n2, m2)) for
-        each A_w<n1><m1>w<n2><m2> role in its moments block, i.e. the cross
-        spectrum of the moment maps w_nm = A * dbeta^n * dp^m (p = 1/T),
-        with n + m <= 2.
+        Free moment spectra of a component: (tag, (n1, m1), (n2, m2), other)
+        for each A_w<n1><m1>w<n2><m2>[_x_<other>] role in its moments block,
+        i.e. the cross spectrum of the moment maps w_nm = A * dbeta^n * dp^m
+        (p = 1/T, n + m <= 2) of this component (other = None) or of this
+        component and component `other`.
         """
         terms = []
         for role in names_mom:
-            m = re.fullmatch(r'A_w(\d)(\d)w(\d)(\d)', role)
+            m = re.fullmatch(r'A_w(\d)(\d)w(\d)(\d)(?:_x_(\w+))?', role)
             if m is None:
                 continue
             a = (int(m.group(1)), int(m.group(2)))
             b = (int(m.group(3)), int(m.group(4)))
+            other = m.group(5)
             if sum(a) > 2 or sum(b) > 2:
                 raise ValueError(f"free moment {role}: maps up to order 2")
             if a == b == (0, 0):
-                raise ValueError("free moment A_w00w00 is the component "
-                                 "itself")
-            terms.append((role[2:], a, b))
+                raise ValueError(f"free moment {role}: the 0x0 term is the "
+                                 "component itself (or epsilon)")
+            terms.append((role[2:], a, b, other))
         return sorted(terms, key=lambda t: t[0])
 
     def _sed_T(self, c_name):
@@ -631,7 +633,15 @@ class BBCompSep(PipelineStage):
         with C^{ab} = A_w<a>w<b> (ell/80)^alpha_w<a>w<b>, in D_ell units at
         nu0 (same units as the amplitude of the component; dbeta
         dimensionless, dp in 1/K). alpha is optional (default 0). Cross
-        terms (a != b) can be negative. Independent of the beta-map moments
+        terms (a != b) can be negative.
+
+        Cross spectra between the moment maps of two components (role
+        A_w<a>w<b>_x_<other component> in the moments block of the first:
+        map a of this component times map b of the other) enter with
+        C^{ab}_ell [c_a(nu1) c'_b(nu2) + c'_b(nu1) c_a(nu2)], in the units
+        of sqrt(A A') (same convention as epsilon * sqrt(C C')).
+
+        Independent of the beta-map moments
         (gamma_beta, amp_beta); BB only, no polarization rotation.
         """
         if 'B' not in self.pol_order:
@@ -648,15 +658,15 @@ class BBCompSep(PipelineStage):
 
         for c_name in self.fg_model.component_names:
             names_mom = self.fg_model.components[c_name]['names_moments_dict']
-            for tag, a, b in self.free_moment_terms(names_mom):
+            for tag, a, b, other in self.free_moment_terms(names_mom):
                 amp = params[names_mom['A_' + tag]]
                 if amp == 0:
                     continue
                 slope = (params[names_mom['alpha_' + tag]]
                          if 'alpha_' + tag in names_mom else 0.)
                 cl = amp * np.exp(slope * lx) * self.dl2cl
-                w = np.outer(c_nm(c_name, a), c_nm(c_name, b))
-                if a != b:
+                w = np.outer(c_nm(c_name, a), c_nm(other or c_name, b))
+                if a != b or other is not None:
                     w = w + w.T
                 for f1 in range(self.nfreqs):
                     for f2 in range(f1, self.nfreqs):
