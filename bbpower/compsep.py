@@ -701,6 +701,47 @@ class BBCompSep(PipelineStage):
         mat = mat / d[:, :, None] / d[:, None, :]
         return bool(np.all(np.linalg.eigvalsh(mat)[:, 0] >= -1e-10))
 
+    def moments_hierarchical(self, params, k):
+        """
+        True if, at every multipole of the data and for every component, the
+        second-order moment auto-spectra are bounded by the first-order ones:
+
+            C[w20 x w20] <= k C[w10 x w10]^2 / C[w00 x w00]   (beta)
+            C[w02 x w02] <= k C[w01 x w01]^2 / C[w00 x w00]   (p = 1/T)
+            C[w11 x w11] <= k C[w10 x w10] C[w01 x w01] / C[w00 x w00]
+
+        For a Gaussian delta-beta uncorrelated with the amplitude the ratio
+        is ~3 (<dbeta^4> = 3 sigma^4). A second-order map without its
+        first-order auto-spectrum must then have zero power. Enabled by
+        fg_model: moments_hierarchy: k.
+        """
+        cov = self.moment_covariance(params)
+        if cov is None:
+            return True
+        idx, mat = cov
+
+        def auto(c_name, kk):
+            i = idx.get((c_name, kk))
+            return None if i is None else mat[:, i, i]
+
+        for c_name in self.fg_model.component_names:
+            c00 = auto(c_name, (0, 0))
+            if c00 is None:
+                continue
+            for second, f1, f2 in [((2, 0), (1, 0), (1, 0)),
+                                   ((0, 2), (0, 1), (0, 1)),
+                                   ((1, 1), (1, 0), (0, 1))]:
+                c2 = auto(c_name, second)
+                if c2 is None:
+                    continue
+                a1 = auto(c_name, f1)
+                a2 = auto(c_name, f2)
+                a1 = 0. if a1 is None else a1
+                a2 = 0. if a2 is None else a2
+                if np.any(c2 > k * a1 * a2 / c00 * (1 + 1e-10)):
+                    return False
+        return True
+
     def add_free_moments(self, params, cls_array_fg):
         """
         Moment expansion with free cross spectra of the moment maps,
@@ -851,6 +892,10 @@ class BBCompSep(PipelineStage):
         fgm = self.config['fg_model']
         if (fgm.get('use_moments') and fgm.get('moments_positive')
                 and not self.moments_positive(params)):
+            return -np.inf
+        if (fgm.get('use_moments') and fgm.get('moments_hierarchy')
+                and not self.moments_hierarchical(params,
+                                                  fgm['moments_hierarchy'])):
             return -np.inf
         if self.use_handl:
             dx = self.h_and_l_dx(params)
