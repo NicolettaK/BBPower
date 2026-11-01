@@ -950,7 +950,10 @@ class BBCompSep(PipelineStage):
             pos = None
             nsteps_use = max(n_iters-nchain, 0)
 
-        with Pool() as pool:  # noqa
+        # BBPOWER_NPROC: number of pool processes (e.g. several runs per
+        # node on a cluster); default: all cores
+        nproc = int(os.environ.get('BBPOWER_NPROC', 0)) or None
+        with Pool(nproc) as pool:  # noqa
             import time
             start = time.time()
             sampler = emcee.EnsembleSampler(nwalkers, ndim,
