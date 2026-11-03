@@ -13,6 +13,17 @@ from .bandpasses import (Bandpass, rotate_cells, rotate_cells_mat,
 import sacc
 
 
+# Log-probability for the emcee pool: a module-level function calling the
+# lnprob of the instance set just before the (forked) pool is created, so
+# that the workers inherit it instead of receiving the whole BBCompSep
+# object pickled at every step
+_EMCEE_LNPROB = None
+
+
+def _emcee_lnprob(p):
+    return _EMCEE_LNPROB(p)
+
+
 class BBCompSep(PipelineStage):
     """
     Component separation stage
@@ -925,7 +936,7 @@ class BBCompSep(PipelineStage):
         Sample the model with MCMC.
         """
         import emcee
-        from multiprocessing import Pool
+        import multiprocessing
 
         fname_temp = self.get_output('output_dir')+'/emcee.npz.h5'
         backend = emcee.backends.HDFBackend(fname_temp)
@@ -951,17 +962,29 @@ class BBCompSep(PipelineStage):
             nsteps_use = max(n_iters-nchain, 0)
 
         # BBPOWER_NPROC: number of pool processes (e.g. several runs per
-        # node on a cluster); default: all cores
+        # node on a cluster); default: all cores. The pool is forked after
+        # the setup (the workers inherit the instance); without fork (or
+        # with BBPOWER_NPROC=1) emcee runs serially
+        global _EMCEE_LNPROB
+        _EMCEE_LNPROB = self.lnprob
         nproc = int(os.environ.get('BBPOWER_NPROC', 0)) or None
-        with Pool(nproc) as pool:  # noqa
+        if nproc != 1 and 'fork' in multiprocessing.get_all_start_methods():
+            pool = multiprocessing.get_context('fork').Pool(nproc)
+        else:
+            pool = None
+        try:
             import time
             start = time.time()
             sampler = emcee.EnsembleSampler(nwalkers, ndim,
-                                            self.lnprob,
+                                            _emcee_lnprob, pool=pool,
                                             backend=backend)
             if nsteps_use > 0:
                 sampler.run_mcmc(pos, nsteps_use, store=True, progress=False)
             end = time.time()
+        finally:
+            if pool is not None:
+                pool.close()
+                pool.join()
 
         return sampler, end-start
 
