@@ -24,6 +24,15 @@ def _emcee_lnprob(p):
     return _EMCEE_LNPROB(p)
 
 
+# free_moment_terms parsed once per set of moment roles (the regexes cost
+# more than the rest of the moment terms)
+_FREE_MOMENT_TERMS = {}
+
+# "not given" for the optional moment covariance of moments_positive and
+# moments_hierarchical (None is a valid covariance: no free moments)
+_UNSET = object()
+
+
 class BBCompSep(PipelineStage):
     """
     Component separation stage
@@ -57,7 +66,74 @@ class BBCompSep(PipelineStage):
             self.precompute_w3j()
         if self.use_handl:
             self.prepare_h_and_l()
+        self.setup_fast_model()
         return
+
+    def setup_fast_model(self):
+        """
+        Pre-computations of model_fast, used by model() when nothing rotates
+        the polarization (no polarization angles, frequency-dependent phases,
+        birefringence) and no component is decorrelated. All the bandpasses
+        are joined in one frequency grid, so that each SED is evaluated once
+        per call and integrated over all the bands at once; config option
+        fast_model: False forces the general model.
+        """
+        cfg = self.config
+        self.fast = (cfg.get('fast_model') is not False
+                     and not cfg['cmb_model'].get('use_birefringence')
+                     and not any(b.is_complex or b.do_angle or b.do_dphi1
+                                 for b in self.bpss)
+                     and not any(self.fg_model.components[c]['decorr']
+                                 for c in self.fg_model.component_names))
+        if not self.fast:
+            return
+        bp = self.bpss
+        self._bp_len = np.array([len(b.nu) for b in bp])
+        self._bp_start = np.concatenate([[0], np.cumsum(self._bp_len)[:-1]])
+        self._bp_nu = np.concatenate([b.nu for b in bp])
+        # bandpass weights over the CMB normalization (nu^2 apart: it
+        # changes with the frequency shifts)
+        self._bp_bnorm = np.concatenate([b.bnu_dnu / b.cmb_norm for b in bp])
+        self._bp_shift = any(b.do_shift for b in bp)
+        self._bp_gain = any(b.do_gain for b in bp)
+        if not (self._bp_shift or self._bp_gain):
+            self._bp_w0 = self._bp_bnorm * self._bp_nu**2
+            self._cmb_scaling0 = self._bp_integrate(
+                bp[0].sed_CMB_RJ(self._bp_nu) * self._bp_w0, None)
+        # beta-map moments (Wigner-3j terms) in some component
+        self._beta_map = [i_c for i_c, c in
+                          enumerate(self.fg_model.component_names)
+                          if 'gamma_beta' in
+                          self.fg_model.components[c]['names_moments_dict']]
+        # data vector <-> (f1, p1, f2, p2) of the model spectra
+        m1, m2 = self.index_ut
+        self._ut_f1, self._ut_p1 = m1 // self.npol, m1 % self.npol
+        self._ut_f2, self._ut_p2 = m2 // self.npol, m2 % self.npol
+        assert np.all(self.vector_indices[m1, m2] ==
+                      np.arange(self.ncross)), "unexpected spectra ordering"
+
+    def _bp_grid(self, params):
+        """Frequencies and integration weights of the joined bandpasses."""
+        if not self._bp_shift:
+            if not self._bp_gain:
+                return self._bp_nu, self._bp_w0
+            nu = self._bp_nu
+        else:
+            dnu = np.array([params[b.name_shift] * b.nu_mean if b.do_shift
+                            else 0. for b in self.bpss])
+            nu = self._bp_nu + np.repeat(dnu, self._bp_len)
+        return nu, self._bp_bnorm * nu**2
+
+    def _bp_integrate(self, f, gains):
+        """Integral of f (already weighted, [..., nnu]) over each band."""
+        out = np.add.reduceat(f, self._bp_start, axis=-1)
+        return out if gains is None else out * gains
+
+    def _bp_gains(self, params):
+        if not self._bp_gain:
+            return None
+        return np.array([params[b.name_gain] if b.do_gain else 1.
+                         for b in self.bpss])
 
     def get_moments_lmax(self):
         return self.config['fg_model'].get('moments_lmax', 384)
@@ -360,7 +436,193 @@ class BBCompSep(PipelineStage):
     def model(self, params):
         """
         Defines the total model and integrates over
-        the bandpasses and windows.
+        the bandpasses and windows: model_fast when possible (see
+        setup_fast_model), model_general otherwise.
+        """
+        if getattr(self, 'fast', False):
+            return self.model_fast(params)
+        return self.model_general(params)
+
+    def model_fast(self, params):
+        """
+        Same model as model_general without polarization rotations and
+        decorrelation, vectorized over frequencies and components.
+        """
+        nf, nc, npol = self.nfreqs, self.fg_model.n_components, self.npol
+        comps = [self.fg_model.components[c]
+                 for c in self.fg_model.component_names]
+        # [nell, npol, npol]
+        cmb_cell = np.transpose((params['r_tensor'] * self.cmb_tens +
+                                 params['A_lens'] * self.cmb_lens +
+                                 self.cmb_scal) * self.dl2cl, axes=[2, 0, 1])
+
+        # SEDs on the joined bandpasses, weighted for the integration
+        nu, w = self._bp_grid(params)
+        gains = self._bp_gains(params)
+        if self._bp_shift or self._bp_gain:
+            cmb_scaling = self._bp_integrate(
+                self.bpss[0].sed_CMB_RJ(nu) * w, gains)
+        else:
+            cmb_scaling = self._cmb_scaling0
+        sed_w = []
+        single_sed = np.zeros([nc, nf])
+        for i_c, comp in enumerate(comps):
+            sed_params = [params[comp['names_sed_dict'][k]]
+                          for k in comp['sed'].params]
+            sed_w.append(comp['sed'].eval(nu, *sed_params) * w)
+            single_sed[i_c] = (self._bp_integrate(sed_w[i_c], gains) *
+                               comp['cmb_n0_norm'])
+        # [ncomp, ncomp, nfreq, nfreq]
+        fg_scaling = np.zeros([nc, nc, nf, nf])
+        for i_c1, comp in enumerate(comps):
+            fg_scaling[i_c1, i_c1] = np.outer(single_sed[i_c1],
+                                              single_sed[i_c1])
+            for c_name2, epsname in comp['names_x_dict'].items():
+                i_c2 = self.fg_model.component_order[c_name2]
+                eps = params[epsname]
+                fg_scaling[i_c1, i_c2] = eps * np.outer(single_sed[i_c1],
+                                                        single_sed[i_c2])
+                fg_scaling[i_c2, i_c1] = eps * np.outer(single_sed[i_c2],
+                                                        single_sed[i_c1])
+
+        # [ncomp, nell, npol, npol]
+        fg_cell = np.transpose(self.evaluate_power_spectra(params),
+                               axes=[0, 3, 1, 2])
+        # spectra of the component pairs: auto, and for the cross the
+        # geometric mean of the diagonals (EB term zero)
+        # [ncomp, ncomp, nell, npol, npol]
+        pair_cell = np.zeros((nc, nc) + fg_cell.shape[1:])
+        diag = np.einsum('clii->cli', fg_cell)
+        for c1 in range(nc):
+            for c2 in range(nc):
+                if c1 == c2:
+                    pair_cell[c1, c1] = fg_cell[c1]
+                else:
+                    pair_cell[c1, c2][:, np.arange(npol), np.arange(npol)] = \
+                        np.sqrt(diag[c1] * diag[c2])
+        # [nfreq, nfreq, nell, npol, npol]
+        cls_array_fg = (np.outer(cmb_scaling, cmb_scaling).reshape(
+            nf, nf, 1, 1, 1) * cmb_cell +
+            (fg_scaling.reshape(nc * nc, nf * nf).T @
+             pair_cell.reshape(nc * nc, -1)).reshape((nf, nf) +
+                                                     fg_cell.shape[1:]))
+
+        if self.config['fg_model'].get('use_moments'):
+            if self._beta_map:
+                self._add_beta_map_moments(params, comps, nu, sed_w, gains,
+                                           fg_scaling, fg_cell, cls_array_fg)
+            self._add_free_moments_fast(params, nu, w, sed_w, gains,
+                                        cls_array_fg)
+
+        # Window convolution, all the spectra (upper triangle) at once
+        # [ncross, nell]
+        cls_vec = cls_array_fg[self._ut_f1, self._ut_f2, :,
+                               self._ut_p1, self._ut_p2]
+        # [ncross, nbpw]
+        clband = (self.windows @ cls_vec[:, :, None])[..., 0]
+        out = np.zeros([self.n_bpws, self.nmaps, self.nmaps])
+        out[:, self.index_ut[0], self.index_ut[1]] = clband.T
+        out[:, self.index_ut[1], self.index_ut[0]] = clband.T
+        return out
+
+    def _add_beta_map_moments(self, params, comps, nu, sed_w, gains,
+                              fg_scaling, fg_cell, cls_array_fg):
+        """1x1 and 0x2 terms of the beta-map moments (as model_general)."""
+        nf, nc = self.nfreqs, self.fg_model.n_components
+        # [nfreq, ncomp]
+        d1 = np.zeros([nf, nc])
+        d2 = np.zeros([nf, nc])
+        for i_c, comp in enumerate(comps):
+            x = np.log(nu / params[comp['names_sed_dict']['nu0']])
+            d1[:, i_c] = (self._bp_integrate(x * sed_w[i_c], gains) *
+                          comp['cmb_n0_norm'])
+            d2[:, i_c] = (self._bp_integrate(x**2 * sed_w[i_c], gains) *
+                          comp['cmb_n0_norm'])
+        lmax_mom = self.get_moments_lmax()
+        cls_11 = np.zeros_like(fg_cell)
+        cls_02 = np.zeros_like(fg_cell)
+        for i_c in self._beta_map:
+            names = comps[i_c]['names_moments_dict']
+            cl_betas = self.bcls(lmax=lmax_mom,
+                                 gamma=params[names['gamma_beta']],
+                                 amp=params[names['amp_beta']] * 1E-6)
+            cls_11[i_c, :lmax_mom] = self.evaluate_1x1(
+                params, lmax=lmax_mom, cls_cc=fg_cell[i_c], cls_bb=cl_betas)
+            cls_02[i_c, :lmax_mom] = self.evaluate_0x2(
+                params, lmax=lmax_mom, cls_cc=fg_cell[i_c], cls_bb=cl_betas)
+        # [nfreq, ncomp]
+        sq = np.sqrt(np.einsum('ccff->fc', fg_scaling))
+        cls_array_fg += np.einsum('ic,jc,clpq->ijlpq', d1, d1, cls_11)
+        cls_array_fg += 0.5 * (np.einsum('ic,jc,clpq->ijlpq', d2, sq, cls_02) +
+                               np.einsum('jc,ic,clpq->ijlpq', d2, sq, cls_02))
+
+    def _add_free_moments_fast(self, params, nu, w, sed_w, gains,
+                               cls_array_fg):
+        """add_free_moments with the SEDs already on the joined bandpasses."""
+        if 'B' not in self.pol_order:
+            return
+        ipb = self.pol_order['B']
+        lx = np.log(self.bpw_l / 80.)
+        cache = {}
+
+        def c_nm(c_name, k):
+            if (c_name, k) not in cache:
+                cache[(c_name, k)] = self._c_nm_fast(params, c_name, k, nu,
+                                                     w, sed_w, gains)
+            return cache[(c_name, k)]
+
+        for c_name in self.fg_model.component_names:
+            names_mom = self.fg_model.components[c_name]['names_moments_dict']
+            for tag, a, b, other in self.free_moment_terms(names_mom):
+                amp = params[names_mom['A_' + tag]]
+                if amp == 0:
+                    continue
+                slope = (params[names_mom['alpha_' + tag]]
+                         if 'alpha_' + tag in names_mom else 0.)
+                cl = amp * np.exp(slope * lx) * self.dl2cl
+                wm = np.outer(c_nm(c_name, a), c_nm(other or c_name, b))
+                if a != b or other is not None:
+                    wm = wm + wm.T
+                cls_array_fg[:, :, :, ipb, ipb] += wm[:, :, None] * cl
+
+    def _c_nm_fast(self, params, c_name, k, nu, w, sed_w, gains, eps=1e-3):
+        """integrate_seds_der_bp on the joined bandpasses."""
+        n, m = k
+        i_c = self.fg_model.component_order[c_name]
+        comp = self.fg_model.components[c_name]
+        units = comp['cmb_n0_norm']
+        x = np.log(nu / params[comp['names_sed_dict']['nu0']])
+        norm = 1. / (math.factorial(n) * math.factorial(m))
+        if m == 0:
+            f = x**n * sed_w[i_c]
+        else:
+            if 'temp' not in comp['names_sed_dict']:
+                raise ValueError(f"{c_name}: temperature moments need a "
+                                 "'temp' SED parameter")
+            sed = self._sed_T(c_name)
+            keys = sed.params
+            sed_params = [params[comp['names_sed_dict'][kk]] for kk in keys]
+            i_t = keys.index('temp')
+            p0 = 1. / sed_params[i_t]
+            h = eps * p0
+
+            def sed_at(p):
+                q = list(sed_params)
+                q[i_t] = 1. / p
+                return sed.eval(nu, *q)
+
+            fp, fm = sed_at(p0 + h), sed_at(p0 - h)
+            if m == 1:
+                d = (fp - fm) / (2 * h)
+            else:
+                d = (fp - 2 * sed_at(p0) + fm) / h**2
+            f = x**n * d * w
+        return self._bp_integrate(f, gains) * units * norm
+
+    def model_general(self, params):
+        """
+        Defines the total model and integrates over
+        the bandpasses and windows (any configuration).
         """
         # [npol,npol,nell]
         cmb_cell = (params['r_tensor'] * self.cmb_tens +
@@ -548,6 +810,13 @@ class BBCompSep(PipelineStage):
         (p = 1/T, n + m <= 2) of this component (other = None) or of this
         component and component `other`.
         """
+        key = tuple(sorted(names_mom))
+        if key not in _FREE_MOMENT_TERMS:
+            _FREE_MOMENT_TERMS[key] = BBCompSep._parse_free_moment_terms(key)
+        return _FREE_MOMENT_TERMS[key]
+
+    @staticmethod
+    def _parse_free_moment_terms(names_mom):
         terms = []
         for role in names_mom:
             m = re.fullmatch(r'A_w(\d)(\d)w(\d)(\d)(?:_x_(\w+))?', role)
@@ -694,14 +963,16 @@ class BBCompSep(PipelineStage):
             mat[:, j, i] = cl
         return idx, mat
 
-    def moments_positive(self, params):
+    def moments_positive(self, params, cov=_UNSET):
         """
         True if, at every multipole of the data, the covariance matrix of the
         moment maps (moment_covariance) is positive semi-definite. Only
         components with free moment spectra (and their cross partners)
-        enter. Enabled by fg_model: moments_positive: True.
+        enter. Enabled by fg_model: moments_positive: True. `cov`: the
+        output of moment_covariance(params), if already computed.
         """
-        cov = self.moment_covariance(params)
+        if cov is _UNSET:
+            cov = self.moment_covariance(params)
         if cov is None:
             return True
         mat = cov[1]
@@ -712,7 +983,7 @@ class BBCompSep(PipelineStage):
         mat = mat / d[:, :, None] / d[:, None, :]
         return bool(np.all(np.linalg.eigvalsh(mat)[:, 0] >= -1e-10))
 
-    def moments_hierarchical(self, params, k):
+    def moments_hierarchical(self, params, k, cov=_UNSET):
         """
         True if, at every multipole of the data and for every component, the
         second-order moment auto-spectra are bounded by the first-order ones:
@@ -724,9 +995,11 @@ class BBCompSep(PipelineStage):
         For a Gaussian delta-beta uncorrelated with the amplitude the ratio
         is ~3 (<dbeta^4> = 3 sigma^4). A second-order map without its
         first-order auto-spectrum must then have zero power. Enabled by
-        fg_model: moments_hierarchy: k.
+        fg_model: moments_hierarchy: k. `cov`: the output of
+        moment_covariance(params), if already computed.
         """
-        cov = self.moment_covariance(params)
+        if cov is _UNSET:
+            cov = self.moment_covariance(params)
         if cov is None:
             return True
         idx, mat = cov
@@ -914,13 +1187,17 @@ class BBCompSep(PipelineStage):
         """
         params = self.params.build_params(par)
         fgm = self.config['fg_model']
-        if (fgm.get('use_moments') and fgm.get('moments_positive')
-                and not self.moments_positive(params)):
-            return -np.inf
-        if (fgm.get('use_moments') and fgm.get('moments_hierarchy')
-                and not self.moments_hierarchical(params,
-                                                  fgm['moments_hierarchy'])):
-            return -np.inf
+        if fgm.get('use_moments') and (fgm.get('moments_positive') or
+                                       fgm.get('moments_hierarchy')):
+            # computed once for both constraints
+            cov = self.moment_covariance(params)
+            if (fgm.get('moments_positive')
+                    and not self.moments_positive(params, cov)):
+                return -np.inf
+            if (fgm.get('moments_hierarchy')
+                    and not self.moments_hierarchical(
+                        params, fgm['moments_hierarchy'], cov)):
+                return -np.inf
         if self.use_handl:
             dx = self.h_and_l_dx(params)
             if np.any(np.isinf(dx)):

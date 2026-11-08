@@ -83,6 +83,13 @@ class ParameterManager(object):
                     i_bps += 1
 
         self.p0 = np.array(self.p0)
+        # priors as (is_gaussian, a, b): (mean, sigma) or (low, high), so
+        # that lnprior does not parse the prior names at every call
+        self._priors = []
+        for pr in self.p_free_priors:
+            gauss = str(pr[1]).lower() == 'gaussian'
+            self._priors.append((gauss, float(pr[2][0]),
+                                 float(pr[2][1] if gauss else pr[2][2])))
 
     def build_params(self, par):
         params = dict(self.p_fixed)
@@ -91,10 +98,10 @@ class ParameterManager(object):
 
     def lnprior(self, par):
         lnp = 0
-        for p, pr in zip(par, self.p_free_priors):
-            if np.char.lower(pr[1]) == 'gaussian':  # Gaussian prior
-                lnp += -0.5 * ((p - pr[2][0])/pr[2][1])**2
+        for p, (gauss, a, b) in zip(par, self._priors):
+            if gauss:  # Gaussian prior
+                lnp += -0.5 * ((p - a)/b)**2
             else:  # Only other option is top-hat
-                if not (float(pr[2][0]) <= p <= float(pr[2][2])):
+                if not (a <= p <= b):
                     return -np.inf
         return lnp
