@@ -1304,6 +1304,61 @@ class BBCompSep(PipelineStage):
 
         return sampler, end-start
 
+    def _prior_fraction_cache(self, n):
+        """
+        Cache of the allowed prior fraction (moment constraints) in the
+        directory BBPOWER_PRIOR_CACHE (none if unset): the fraction depends
+        only on the foreground priors and constraints, the multipoles and
+        n, not on the data nor on the CMB parameters, so it is shared by the
+        same model in every set and by its r-free / r = 0 versions. Key:
+        the fg_model config without the tophat centres (starting points
+        only), pol channels, l_min, l_max, the multipoles, n. One file per
+        key, written atomically. Returns an object with get() (number of
+        allowed draws or None) and put(n_ok), or None.
+        """
+        import hashlib
+        import json
+        d = os.environ.get('BBPOWER_PRIOR_CACHE')
+        if not d:
+            return None
+
+        def strip(x):
+            if isinstance(x, dict):
+                return {k: strip(v) for k, v in sorted(x.items())}
+            if isinstance(x, (list, tuple)):
+                if (len(x) == 3 and str(x[1]).lower() == 'tophat'
+                        and isinstance(x[2], (list, tuple))
+                        and len(x[2]) == 3):
+                    return [x[0], 'tophat', [float(x[2][0]), float(x[2][2])]]
+                return [strip(v) for v in x]
+            return x
+
+        key = json.dumps(dict(fg_model=strip(self.config['fg_model']),
+                              pol_channels=list(self.config['pol_channels']),
+                              l_min=self.config['l_min'],
+                              l_max=self.config['l_max'],
+                              ells=[float(x) for x in self.bpw_l], n=n),
+                         sort_keys=True, default=str)
+        path = os.path.join(d, 'prior_fraction_' +
+                            hashlib.sha1(key.encode()).hexdigest() + '.json')
+
+        class Cache:
+            def get(self):
+                try:
+                    c = json.load(open(path))
+                except (OSError, ValueError):
+                    return None
+                return c['n_ok'] if c.get('key') == key else None
+
+            def put(self, n_ok):
+                os.makedirs(d, exist_ok=True)
+                tmp = f"{path}.{os.getpid()}.tmp"
+                with open(tmp, 'w') as f:
+                    json.dump(dict(n_ok=int(n_ok), n=n, key=key), f)
+                os.replace(tmp, path)
+
+        return Cache()
+
     def nautilus_sampler(self):
         """
         Evidence and posterior with nautilus (Lange 2023, MNRAS 525, 3181:
@@ -1322,7 +1377,8 @@ class BBCompSep(PipelineStage):
         estimated with n_prior draws from the prior (constraints only, no
         likelihood). Fewer than 100 allowed draws: ValueError ("allowed
         prior fraction too small"), as PolyChord unable to generate its
-        live points.
+        live points. With BBPOWER_PRIOR_CACHE (a directory) the fraction is
+        computed once per model and reused (_prior_fraction_cache).
 
         Writes to <output_dir>/nautilus:
           results.npz: log_z (restricted prior), log_z_err (1/sqrt(n_eff)
@@ -1361,13 +1417,18 @@ class BBCompSep(PipelineStage):
             log_f, log_f_err = 0., 0.
             if self.moment_constraints():
                 n = int(opts['n_prior'])
-                rng = np.random.default_rng(opts['seed'])
-                pts = prior.unit_to_physical(
-                    rng.random((n, len(self.params.p0))))
-                chunks = np.array_split(pts, 64)
-                n_ok = sum(pool.map(_nautilus_allowed, chunks)
-                           if pool is not None else
-                           map(_nautilus_allowed, chunks))
+                cache = self._prior_fraction_cache(n)
+                n_ok = cache and cache.get()
+                if n_ok is None:
+                    rng = np.random.default_rng(opts['seed'])
+                    pts = prior.unit_to_physical(
+                        rng.random((n, len(self.params.p0))))
+                    chunks = np.array_split(pts, 64)
+                    n_ok = sum(pool.map(_nautilus_allowed, chunks)
+                               if pool is not None else
+                               map(_nautilus_allowed, chunks))
+                    if cache:
+                        cache.put(n_ok)
                 # as PolyChord unable to generate its live points: too
                 # small an allowed region (and ln f too uncertain)
                 if n_ok < 100:
