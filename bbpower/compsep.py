@@ -1400,7 +1400,13 @@ class BBCompSep(PipelineStage):
                  n_eff=n_eff, n_like=int(sampler.n_like),
                  names=self.params.p_free_names, points=points,
                  log_w=log_w, log_l=log_l, time=elapsed)
-        p_eq, _, l_eq = sampler.posterior(equal_weight=True)
+        # equal-weight samples: about n_eff of them (each point drawn on
+        # average boost * w / max(w) times; without boost only
+        # sum(w) / max(w) ~ n_eff / 3, too few for the 3 sigma tails)
+        w = np.exp(log_w - log_w.max())
+        boost = max(1., n_eff / w.sum())
+        p_eq, _, l_eq = sampler.posterior(equal_weight=True,
+                                          equal_weight_boost=boost)
         np.savetxt(out + '/equal_weights.txt',
                    np.column_stack([np.ones(len(p_eq)), -2 * l_eq, p_eq]))
         print(f"log(Z) = {log_z:.6f} +/- {log_z_err:.6f}  (allowed prior "
