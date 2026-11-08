@@ -24,6 +24,33 @@ def _emcee_lnprob(p):
     return _EMCEE_LNPROB(p)
 
 
+# Same for the nautilus pool (likelihood without priors)
+_NAUTILUS_LNLIKE = None
+
+
+def _nautilus_lnlike(p):
+    return _NAUTILUS_LNLIKE(p)
+
+
+_NAUTILUS_ALLOWED = None
+
+
+def _nautilus_allowed(points):
+    return sum(_NAUTILUS_ALLOWED(p) for p in points)
+
+
+def _fork_pool():
+    """
+    Pool of BBPOWER_NPROC processes (default: all cores), forked so that the
+    workers inherit the instance; None without fork or with BBPOWER_NPROC=1.
+    """
+    import multiprocessing
+    nproc = int(os.environ.get('BBPOWER_NPROC', 0)) or None
+    if nproc != 1 and 'fork' in multiprocessing.get_all_start_methods():
+        return multiprocessing.get_context('fork').Pool(nproc)
+    return None
+
+
 # free_moment_terms parsed once per set of moment roles (the regexes cost
 # more than the rest of the moment terms)
 _FREE_MOMENT_TERMS = {}
@@ -1181,23 +1208,40 @@ class BBCompSep(PipelineStage):
 
         return prior + self.lnlike(par)
 
+    def moment_constraints(self):
+        """True if moments_positive or moments_hierarchy is enabled."""
+        fgm = self.config['fg_model']
+        return bool(fgm.get('use_moments') and
+                    (fgm.get('moments_positive') or
+                     fgm.get('moments_hierarchy')))
+
+    def moments_allowed(self, params):
+        """
+        True if the parameters satisfy the enabled moment constraints
+        (moments_positive, moments_hierarchy). Outside them the likelihood
+        is -inf, i.e. the constraints are part of the prior.
+        """
+        if not self.moment_constraints():
+            return True
+        fgm = self.config['fg_model']
+        # computed once for both constraints
+        cov = self.moment_covariance(params)
+        if (fgm.get('moments_positive')
+                and not self.moments_positive(params, cov)):
+            return False
+        if (fgm.get('moments_hierarchy')
+                and not self.moments_hierarchical(
+                    params, fgm['moments_hierarchy'], cov)):
+            return False
+        return True
+
     def lnlike(self, par):
         """
-        Likelihood without priors. 
+        Likelihood without priors.
         """
         params = self.params.build_params(par)
-        fgm = self.config['fg_model']
-        if fgm.get('use_moments') and (fgm.get('moments_positive') or
-                                       fgm.get('moments_hierarchy')):
-            # computed once for both constraints
-            cov = self.moment_covariance(params)
-            if (fgm.get('moments_positive')
-                    and not self.moments_positive(params, cov)):
-                return -np.inf
-            if (fgm.get('moments_hierarchy')
-                    and not self.moments_hierarchical(
-                        params, fgm['moments_hierarchy'], cov)):
-                return -np.inf
+        if not self.moments_allowed(params):
+            return -np.inf
         if self.use_handl:
             dx = self.h_and_l_dx(params)
             if np.any(np.isinf(dx)):
@@ -1213,7 +1257,6 @@ class BBCompSep(PipelineStage):
         Sample the model with MCMC.
         """
         import emcee
-        import multiprocessing
 
         fname_temp = self.get_output('output_dir')+'/emcee.npz.h5'
         backend = emcee.backends.HDFBackend(fname_temp)
@@ -1244,11 +1287,7 @@ class BBCompSep(PipelineStage):
         # with BBPOWER_NPROC=1) emcee runs serially
         global _EMCEE_LNPROB
         _EMCEE_LNPROB = self.lnprob
-        nproc = int(os.environ.get('BBPOWER_NPROC', 0)) or None
-        if nproc != 1 and 'fork' in multiprocessing.get_all_start_methods():
-            pool = multiprocessing.get_context('fork').Pool(nproc)
-        else:
-            pool = None
+        pool = _fork_pool()
         try:
             import time
             start = time.time()
@@ -1264,6 +1303,105 @@ class BBCompSep(PipelineStage):
                 pool.join()
 
         return sampler, end-start
+
+    def nautilus_sampler(self):
+        """
+        Evidence and posterior with nautilus (Lange 2023, MNRAS 525, 3181:
+        importance nested sampling with neural-network bounds), same
+        likelihood (lnlike) and priors as polychord_sampler (tophat ->
+        uniform, Gaussian -> normal). Config block `nautilus` (optional):
+        n_live (2000), n_eff (10000, effective posterior samples), seed
+        (none), n_networks (4), n_prior (100000, see below). Pool of
+        BBPOWER_NPROC processes.
+
+        With moment constraints (moments_positive, moments_hierarchy) the
+        prior is the one restricted to the allowed region and normalized
+        there, as in PolyChord (points with ln L = -inf are outside its
+        prior): nautilus integrates over the whole prior box, so its
+        evidence is divided by the allowed fraction f of the prior,
+        estimated with n_prior draws from the prior (constraints only, no
+        likelihood).
+
+        Writes to <output_dir>/nautilus:
+          results.npz: log_z (restricted prior), log_z_err (1/sqrt(n_eff)
+            and the error of ln f; nautilus gives no error, the scatter
+            between seeds is of the order of 1/sqrt(n_eff)), log_z_box
+            (whole prior box), log_f, n_eff, n_like, names, points, log_w,
+            log_l (weighted posterior)
+          equal_weights.txt: equal-weight posterior in the format of
+            PolyChord's pch_equal_weights.txt (1, -2 ln L, parameters)
+        """
+        import time
+        from scipy import stats
+        from nautilus import Prior, Sampler
+
+        opts = dict(n_live=2000, n_eff=10000, seed=None, n_networks=4,
+                    n_prior=100000)
+        opts.update(self.config.get('nautilus') or {})
+        prior = Prior()
+        for name, pr in zip(self.params.p_free_names,
+                            self.params.p_free_priors):
+            v = [float(x) for x in pr[2]]
+            if str(pr[1]).lower() == 'gaussian':
+                prior.add_parameter(name, dist=stats.norm(loc=v[0],
+                                                          scale=v[1]))
+            else:
+                prior.add_parameter(name, dist=(v[0], v[2]))
+
+        global _NAUTILUS_LNLIKE, _NAUTILUS_ALLOWED
+        _NAUTILUS_LNLIKE = self.lnlike
+        _NAUTILUS_ALLOWED = (lambda p: self.moments_allowed(
+            self.params.build_params(p)))
+        pool = _fork_pool()
+        try:
+            start = time.time()
+            # allowed fraction of the prior (moment constraints)
+            log_f, log_f_err = 0., 0.
+            if self.moment_constraints():
+                n = int(opts['n_prior'])
+                rng = np.random.default_rng(opts['seed'])
+                pts = prior.unit_to_physical(
+                    rng.random((n, len(self.params.p0))))
+                chunks = np.array_split(pts, 64)
+                n_ok = sum(pool.map(_nautilus_allowed, chunks)
+                           if pool is not None else
+                           map(_nautilus_allowed, chunks))
+                if n_ok == 0:
+                    raise ValueError("no prior sample satisfies the moment "
+                                     "constraints")
+                f = n_ok / n
+                log_f = float(np.log(f))
+                log_f_err = float(np.sqrt((1 - f) / (f * n)))
+            sampler = Sampler(prior, _nautilus_lnlike, pass_dict=False,
+                              n_live=int(opts['n_live']),
+                              n_networks=int(opts['n_networks']),
+                              pool=pool, seed=opts['seed'])
+            sampler.run(n_eff=int(opts['n_eff']), verbose=False)
+            elapsed = time.time() - start
+        finally:
+            if pool is not None:
+                pool.close()
+                pool.join()
+
+        out = self.get_output('output_dir') + '/nautilus'
+        os.makedirs(out, exist_ok=True)
+        points, log_w, log_l = sampler.posterior()
+        log_z_box = float(sampler.log_z)
+        log_z = log_z_box - log_f
+        n_eff = float(sampler.n_eff)
+        log_z_err = float(np.sqrt(1. / n_eff + log_f_err**2))
+        np.savez(out + '/results.npz', log_z=log_z, log_z_err=log_z_err,
+                 log_z_box=log_z_box, log_f=log_f, log_f_err=log_f_err,
+                 n_eff=n_eff, n_like=int(sampler.n_like),
+                 names=self.params.p_free_names, points=points,
+                 log_w=log_w, log_l=log_l, time=elapsed)
+        p_eq, _, l_eq = sampler.posterior(equal_weight=True)
+        np.savetxt(out + '/equal_weights.txt',
+                   np.column_stack([np.ones(len(p_eq)), -2 * l_eq, p_eq]))
+        print(f"log(Z) = {log_z:.6f} +/- {log_z_err:.6f}  (allowed prior "
+              f"fraction: ln f = {log_f:.4f} +/- {log_f_err:.4f}; n_eff "
+              f"{n_eff:.0f}, n_like {sampler.n_like}, {elapsed:.1f} s)")
+        return sampler
 
     def polychord_sampler(self):
         import pypolychord
@@ -1424,6 +1562,9 @@ class BBCompSep(PipelineStage):
             print("Finished sampling", timing)
         elif self.config.get('sampler') == 'polychord':
             sampler = self.polychord_sampler()
+            print("Finished sampling")
+        elif self.config.get('sampler') == 'nautilus':
+            sampler = self.nautilus_sampler()
             print("Finished sampling")
         elif self.config.get('sampler') == 'fisher':
             p0, fisher = self.fisher()
