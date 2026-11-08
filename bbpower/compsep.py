@@ -1320,7 +1320,9 @@ class BBCompSep(PipelineStage):
         prior): nautilus integrates over the whole prior box, so its
         evidence is divided by the allowed fraction f of the prior,
         estimated with n_prior draws from the prior (constraints only, no
-        likelihood).
+        likelihood). Fewer than 100 allowed draws: ValueError ("allowed
+        prior fraction too small"), as PolyChord unable to generate its
+        live points.
 
         Writes to <output_dir>/nautilus:
           results.npz: log_z (restricted prior), log_z_err (1/sqrt(n_eff)
@@ -1366,9 +1368,12 @@ class BBCompSep(PipelineStage):
                 n_ok = sum(pool.map(_nautilus_allowed, chunks)
                            if pool is not None else
                            map(_nautilus_allowed, chunks))
-                if n_ok == 0:
-                    raise ValueError("no prior sample satisfies the moment "
-                                     "constraints")
+                # as PolyChord unable to generate its live points: too
+                # small an allowed region (and ln f too uncertain)
+                if n_ok < 100:
+                    raise ValueError(f"allowed prior fraction too small: "
+                                     f"{n_ok} of {n} prior samples satisfy "
+                                     "the moment constraints")
                 f = n_ok / n
                 log_f = float(np.log(f))
                 log_f_err = float(np.sqrt((1 - f) / (f * n)))
