@@ -358,7 +358,34 @@ class BBCompSep(PipelineStage):
                                      self.n_bpws * self.ncross])
         self.invcov = np.linalg.solve(self.bbcovar,
                                       np.identity(len(self.bbcovar)))
+        self.apply_hartlap(cv2d)
         return
+
+    def apply_hartlap(self, cv2d):
+        """
+        Hartlap correction (Hartlap et al. 2007) of the inverse covariance
+        estimated from N simulations (config option hartlap_nsims = N):
+        invcov *= h = (N - p - 2) / (N - 1), with p the size of the matrices
+        actually inverted: ncross if the covariance is block-diagonal in the
+        bandpowers (each block inverted on its own), otherwise the size of
+        the whole data vector. Without the option nothing changes.
+        """
+        nsims = self.config.get('hartlap_nsims')
+        if not nsims:
+            self.hartlap = 1.
+            return
+        off = cv2d.copy()
+        for b in range(self.n_bpws):
+            off[b, :, b, :] = 0
+        p = self.ncross if not np.any(off) else len(self.bbcovar)
+        h = (nsims - p - 2) / (nsims - 1)
+        if h <= 0:
+            raise ValueError(f"Hartlap factor {h:.3f} <= 0: {nsims} "
+                             f"simulations for a covariance of size {p}")
+        self.hartlap = h
+        self.invcov *= h
+        print(f"Hartlap correction: {nsims} simulations, blocks of size "
+              f"{p}, inverse covariance x {h:.4f}")
 
     def load_cmb(self):
         """
